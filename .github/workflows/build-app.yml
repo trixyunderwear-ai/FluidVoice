@@ -53,7 +53,7 @@ jobs:
         APP_PATH="$(find DerivedData/Build/Products/Debug -maxdepth 1 -name '*.app' | head -1)"
         test -n "$APP_PATH"
         APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
-        lipo -verify_arch arm64 "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
+        lipo "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE" -verify_arch arm64
         ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" FluidVoice-Debug.zip
 
     - name: Upload artifact
