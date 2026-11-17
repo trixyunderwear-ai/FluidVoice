@@ -1717,8 +1717,13 @@ struct ContentView: View {
         self.captureRecordingFormattingContextIfNeeded()
     }
 
-    private func resolveTypingTargetPID() -> (pid: pid_t?, shouldRestoreOriginalFocus: Bool) {
+    private func resolveTypingTargetPID(preferRecordingTarget: Bool = false) -> (pid: pid_t?, shouldRestoreOriginalFocus: Bool) {
         let originalPID = NotchContentState.shared.recordingTargetPID
+        // Delayed automatic dictation belongs to the field captured at start,
+        // not whichever app happens to be frontmost when ASR finishes.
+        if preferRecordingTarget {
+            return (originalPID, true)
+        }
         let currentFocusedPID = TypingService.captureSystemFocusedPID()
             ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
 
@@ -2432,19 +2437,20 @@ struct ContentView: View {
                 model: transcriptionModelInfo.model
             )
         }
-        // When FluidVoice itself is frontmost, the bound editor already receives `finalText`.
-        // Avoid re-inserting or overwriting the clipboard in that self-target case.
+        // Only a recording that STARTED in FluidVoice belongs to its editor.
+        // Opening our overlay/settings during recognition must not retarget it.
+        let isFluidRecordingTarget = self.recordingFocusTarget?.pid == ProcessInfo.processInfo.processIdentifier
+        let shouldTypeExternally = shouldPersistOutputs && !isFluidRecordingTarget
         let shouldCopyToClipboard = shouldPersistOutputs &&
             !sendsExistingDraft &&
             SettingsStore.shared.copyTranscriptionToClipboard &&
-            !isFluidFrontmost
+            shouldTypeExternally
 
         if shouldCopyToClipboard {
             ClipboardService.copyToClipboard(finalText)
         }
 
         var didTypeExternally = false
-        let shouldTypeExternally = shouldPersistOutputs && !isFluidFrontmost
 
         DebugLogger.shared.debug(
             "Typing decision → frontmost: \(frontmostName), fluidFrontmost: \(isFluidFrontmost), editorFocused: \(self.isTranscriptionFocused), willTypeExternally: \(shouldTypeExternally)",
@@ -2452,7 +2458,16 @@ struct ContentView: View {
         )
 
         if shouldTypeExternally {
-            let typingTarget = self.resolveTypingTargetPID()
+            let typingTarget = self.resolveTypingTargetPID(preferRecordingTarget: true)
+            guard let focusTarget = self.recordingFocusTarget,
+                  typingTarget.pid == focusTarget.pid
+            else {
+                // History was saved above. Also retain a plain clipboard backup
+                // when Accessibility could not capture the original field.
+                ClipboardService.copyToClipboard(finalText)
+                self.hideOverlayAfterOutput()
+                return
+            }
             let spokenSendRequested = spokenSendParse.shouldSend
             let targetMatchesRecordingFocus = typingTarget.pid != nil
                 && typingTarget.pid == self.recordingFocusTarget?.pid
@@ -2465,6 +2480,12 @@ struct ContentView: View {
             // overlay hides asynchronously after output so it cannot delay paste.
             if typingTarget.shouldRestoreOriginalFocus {
                 await self.restoreFocusToRecordingTarget()
+            }
+            guard TypingService.isExactFocusTargetActive(focusTarget) else {
+                ClipboardService.copyToClipboard(finalText)
+                DebugLogger.shared.warning("Dictation retained for manual paste: original field could not be restored", source: "ContentView")
+                self.hideOverlayAfterOutput()
+                return
             }
             if spokenSendAllowed {
                 NotchContentState.shared.setSpokenSendIndicatorState(.sending)
@@ -2481,13 +2502,18 @@ struct ContentView: View {
                 )
                 didTypeExternally = deliveryOutcome.didInsert
             } else {
-                self.asr.typeOutputPlanToActiveField(
+                let deliveryOutcome = await self.asr.typeOutputPlanToActiveFieldAndWait(
                     finalOutputPlan,
                     preferredTargetPID: typingTarget.pid,
                     textReadyAt: finalTextReadyAt,
-                    tracksDictionaryCorrections: true
+                    tracksDictionaryCorrections: true,
+                    requiredFocusTarget: focusTarget
                 )
-                didTypeExternally = true
+                didTypeExternally = deliveryOutcome.didInsert
+            }
+            if !didTypeExternally {
+                ClipboardService.copyToClipboard(finalText)
+                DebugLogger.shared.warning("Dictation retained for manual paste: automatic insertion did not complete", source: "ContentView")
             }
             if spokenSendRequested, !spokenSendAllowed {
                 NotchContentState.shared.setSpokenSendIndicatorState(.failed)
@@ -2817,7 +2843,7 @@ struct ContentView: View {
                 return
             }
 
-            let typingTarget = self.resolveTypingTargetPID()
+            let typingTarget = self.resolveTypingTargetPID(preferRecordingTarget: false)
             guard typingTarget.pid != nil else {
                 DebugLogger.shared.info("Actions: Paste skipped - no external target field available", source: "ContentView")
                 return

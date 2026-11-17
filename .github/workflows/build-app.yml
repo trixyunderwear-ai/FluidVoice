@@ -5,8 +5,10 @@ name: Build App Artifact
 
 on:
   workflow_dispatch:
+  pull_request:
+    branches: [ gigaam-stable ]
   push:
-    branches: [ feat/gigaam-v3 ]
+    branches: [ feat/gigaam-v3, gigaam-stable ]
 
 jobs:
   build-app:
@@ -22,6 +24,9 @@ jobs:
       uses: maxim-lobanov/setup-xcode@v1
       with:
         xcode-version: latest-stable
+
+    - name: Test original-field dictation and manual recovery
+      run: python3 Tests/run_original_dictation_target_tests.py
 
     - name: Build (unsigned)
       run: |

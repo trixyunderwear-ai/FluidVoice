@@ -10,8 +10,8 @@ view = (ROOT / "Sources/Fluid/ContentView.swift").read_text()
 typing = (ROOT / "Sources/Fluid/Services/TypingService.swift").read_text()
 
 
-def method(source, name):
-    start = source.index("    private func " + name + "(")
+def method(source, name, prefix="private func"):
+    start = source.index("    " + prefix + " " + name + "(")
     opening = source.index("{", start)
     depth = 1
     i = opening + 1
@@ -24,6 +24,7 @@ def method(source, name):
 resolver = method(view, "resolveTypingTargetPID")
 insertion = method(typing, "insertTextInstantly")
 strict = method(typing, "insertTextIntoCapturedTarget") if "private func insertTextIntoCapturedTarget(" in typing else ""
+clipboard = method(typing, "insertTextViaClipboardToPid") if strict else ""
 swift = r'''
 import Foundation
 import CoreFoundation
@@ -49,6 +50,13 @@ final class NotchContentState {
 enum AXError { case success, failure }
 let kAXSelectedTextAttribute = "AXSelectedText"
 func AXIsProcessTrusted() -> Bool { true }
+enum CGEventFlags { case maskCommand }
+final class CGEvent {
+    static var postedPIDs = [Int32]()
+    var flags = CGEventFlags.maskCommand
+    init?(keyboardEventSource: Any?, virtualKey: UInt16, keyDown: Bool) {}
+    func postToPid(_ pid: Int32) { CGEvent.postedPIDs.append(pid) }
+}
 func AXUIElementSetAttributeValue(_ element: Int, _ attribute: CFString, _ value: CFTypeRef) -> AXError {
     TypingService.axWrites.append(element)
     if TypingService.driftDuringAX { TypingService.exactFocus = false }
@@ -66,14 +74,15 @@ final class TypingService {
     static var exactFocus = true
     static var axSucceeds = true
     static var driftDuringAX = false
+    static var driftDuringClipboard = false
     static var axWrites = [Int]()
     var fallbackCalls = 0
-    var targetedPastes = [Int32]()
+    var targetedPastes: [Int32] { CGEvent.postedPIDs }
+    static let pasteVirtualKeyCode: UInt16 = 9
+    static func activateApp(pid: Int32) -> Bool { true }
     static func captureSystemFocusedPID() -> Int32? { focusedPID }
     static func isExactFocusTargetActive(_ target: CapturedFocusTarget) -> Bool { exactFocus }
-    static func canInsertBeforePostInsertionAction(preferredTargetPID: Int32?, requiredTargetPID: Int32?, isSecureTextField: Bool, exactFocusIsActive: Bool) -> Bool {
-        preferredTargetPID != nil && preferredTargetPID == requiredTargetPID && !isSecureTextField && exactFocusIsActive
-    }
+    CAPTURE_GUARD
     static func logFocusState(_ message: String) {}
     func log(_ message: String) {}
     func ghosttyTargetPID(preferredTargetPID: Int32?) -> Int32? { nil }
@@ -84,12 +93,13 @@ final class TypingService {
     func insertTextBulkHIDInstant(_ text: String) -> Bool { fallbackCalls += 1; return false }
     func insertTextViaClipboard(_ text: String) -> Bool { fallbackCalls += 1; return false }
     func typeCharacter(_ character: Character) { fallbackCalls += 1 }
-    func insertTextViaClipboardToPid(_ text: String, targetPID: Int32, activateTargetFirst: Bool = true, requiredFocusTarget: CapturedFocusTarget? = nil) -> Bool {
-        targetedPastes.append(targetPID)
-        return true
+    func withTemporaryPasteboardString(_ text: String, restoreDelayMicros: useconds_t, action: () -> Bool) -> Bool {
+        if Self.driftDuringClipboard { Self.exactFocus = false }
+        return action()
     }
     INSERTION
     STRICT
+    CLIPBOARD
 }
 final class View {
     var recordingFocusTarget: TypingService.CapturedFocusTarget? = .init(pid: 11, element: 111)
@@ -104,7 +114,7 @@ final class View {
     }
     static func main() {
         let view = View()
-        let target = view.resolveTypingTargetPID()
+        let target = DICTATION_RESOLVE_CALL
         check(target.pid == 11 && target.shouldRestoreOriginalFocus,
               "dictation must retain app A after the user switches to app B")
         FIXED_TESTS
@@ -118,7 +128,7 @@ fixed_tests = r'''
         check(manual.pid == 22, "manual paste-last must follow the CURRENT cursor")
         NotchContentState.shared.recordingTargetPID = nil
         view.recordingFocusTarget = nil
-        check(view.resolveTypingTargetPID().pid == nil,
+        check(view.resolveTypingTargetPID(preferRecordingTarget: true).pid == nil,
               "missing original target must never select the new app")
         let typer = TypingService()
         let original = TypingService.CapturedFocusTarget(pid: 11, element: 111)
@@ -126,6 +136,11 @@ fixed_tests = r'''
               "captured field accepts direct AX insertion")
         check(TypingService.axWrites == [111] && typer.fallbackCalls == 0,
               "write targets the captured element, not another field or global fallback")
+        let secure = TypingService.CapturedFocusTarget(pid: 11, element: 333, isSecureTextField: true)
+        check(!typer.insertTextInstantly("dictation", preferredTargetPID: 11, requiredFocusTarget: secure),
+              "secure fields must not receive delayed automatic dictation")
+        check(!typer.insertTextInstantly("dictation", preferredTargetPID: 22, requiredFocusTarget: original),
+              "mismatched PIDs must never redirect the captured field")
         TypingService.exactFocus = false
         check(!typer.insertTextInstantly("dictation", preferredTargetPID: 11, requiredFocusTarget: original),
               "same-app different-field focus must reject automatic insertion")
@@ -140,13 +155,22 @@ fixed_tests = r'''
               "focus drift must never dispatch to the current field")
         TypingService.exactFocus = true
         TypingService.driftDuringAX = false
+        TypingService.driftDuringClipboard = true
+        check(!typer.insertTextInstantly("dictation", preferredTargetPID: 11, requiredFocusTarget: original),
+              "focus drift while preparing clipboard must suppress event dispatch")
+        check(typer.targetedPastes.isEmpty, "clipboard focus drift must not emit any key events")
+        TypingService.exactFocus = true
+        TypingService.driftDuringClipboard = false
         check(typer.insertTextInstantly("dictation", preferredTargetPID: 11, requiredFocusTarget: original),
               "AX-unsupported fields retain guarded PID paste compatibility")
-        check(typer.targetedPastes == [11] && typer.fallbackCalls == 0,
+        check(typer.targetedPastes == [11, 11] && typer.fallbackCalls == 0,
               "compatibility paste is targeted only to original PID")
 '''
 swift = (swift.replace("RESOLVER", resolver).replace("INSERTION", insertion)
-         .replace("STRICT", strict).replace("FIXED_TESTS", fixed_tests if strict else ""))
+         .replace("STRICT", strict).replace("FIXED_TESTS", fixed_tests if strict else "")
+         .replace("CLIPBOARD", clipboard)
+         .replace("DICTATION_RESOLVE_CALL", "view.resolveTypingTargetPID(preferRecordingTarget: true)" if "preferRecordingTarget:" in resolver else "view.resolveTypingTargetPID()")
+         .replace("CAPTURE_GUARD", method(typing, "canInsertBeforePostInsertionAction", "nonisolated static func")))
 with tempfile.TemporaryDirectory(prefix="fv-original-target-test-") as directory:
     root = Path(directory)
     source = root / "Tests.swift"
@@ -160,5 +184,6 @@ with tempfile.TemporaryDirectory(prefix="fv-original-target-test-") as directory
 assert "preferRecordingTarget: false" in method(view, "pasteLastDictationFromHistory")
 delivery = view[view.index("        if shouldTypeExternally {"):view.index("    private func hideOverlayAfterOutput")]
 assert "typeOutputPlanToActiveFieldAndWait" in delivery
-assert "requiredFocusTarget: self.recordingFocusTarget" in delivery
+assert "resolveTypingTargetPID(preferRecordingTarget: true)" in delivery
+assert "requiredFocusTarget: focusTarget" in delivery
 print("Production caller and recovery wiring verified")
