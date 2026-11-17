@@ -2798,6 +2798,11 @@ struct ContentView: View {
     /// system clipboard, and unlike reprocess, it pastes the existing text verbatim (no new
     /// history entry, no reformatting). Useful when the original auto-insert dropped the tail.
     private func pasteLastDictationFromHistory() {
+        guard !NotchContentState.shared.isProcessing else {
+            NotchOverlayManager.shared.updateTranscriptionText("Still transcribing…")
+            DebugLogger.shared.info("Actions: Paste skipped - current dictation is still processing", source: "ContentView")
+            return
+        }
         guard let last = TranscriptionHistoryStore.shared.entries.first else {
             DebugLogger.shared.info("Actions: Paste requested but history is empty", source: "ContentView")
             return

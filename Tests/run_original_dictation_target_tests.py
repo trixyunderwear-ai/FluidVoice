@@ -181,9 +181,18 @@ with tempfile.TemporaryDirectory(prefix="fv-original-target-test-") as directory
 
 # Exercise the actual production caller as well as its policy: manual recovery is
 # deliberately separate, and live delivery must await the guarded outcome.
-assert "preferRecordingTarget: false" in method(view, "pasteLastDictationFromHistory")
+manual_paste = method(view, "pasteLastDictationFromHistory")
+assert "preferRecordingTarget: false" in manual_paste
+# Static handler-wiring check: never read the previous completed entry while
+# the current recognition is pending. The executable tests above cover routing.
+pending_guard = manual_paste.index("guard !NotchContentState.shared.isProcessing")
+history_read = manual_paste.index("TranscriptionHistoryStore.shared.entries.first")
+assert pending_guard < history_read
+assert 'updateTranscriptionText("Still transcribing…")' in manual_paste[pending_guard:history_read]
+assert "return" in manual_paste[pending_guard:history_read]
 delivery = view[view.index("        if shouldTypeExternally {"):view.index("    private func hideOverlayAfterOutput")]
 assert "typeOutputPlanToActiveFieldAndWait" in delivery
 assert "resolveTypingTargetPID(preferRecordingTarget: true)" in delivery
 assert "requiredFocusTarget: focusTarget" in delivery
 print("Production caller and recovery wiring verified")
+print("Static handler wiring verified: processing gate precedes history lookup")
