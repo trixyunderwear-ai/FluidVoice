@@ -33,6 +33,7 @@ let package = Package(
                 "DynamicNotchKit",
                 .product(name: "TranscribeCpp", package: "transcribe-cpp-swift"),
             ],
+            path: "Sources/Fluid",
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]
