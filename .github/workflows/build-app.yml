@@ -38,6 +38,9 @@ jobs:
           -configuration Debug \
           -destination 'platform=macOS,arch=arm64' \
           -derivedDataPath DerivedData \
+          -disablePackageRepositoryCache \
+          -clonedSourcePackagesDirPath "$RUNNER_TEMP/FluidVoiceSourcePackages" \
+          -onlyUsePackageVersionsFromResolvedFile \
           build \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_REQUIRED=NO \
