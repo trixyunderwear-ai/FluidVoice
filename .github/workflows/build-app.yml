@@ -13,7 +13,7 @@ on:
 jobs:
   build-app:
     name: Build unsigned FluidVoice.app
-    # Use Intel runner capacity; xcodebuild below still targets macOS arm64.
+    # Use Intel runner capacity and cross-build arm64 for a generic Mac.
     runs-on: macos-26-intel
     timeout-minutes: 30
 
@@ -36,12 +36,14 @@ jobs:
           -project Fluid.xcodeproj \
           -scheme Fluid \
           -configuration Debug \
-          -destination 'platform=macOS,arch=arm64' \
+          -destination 'generic/platform=macOS' \
           -derivedDataPath DerivedData \
           -disablePackageRepositoryCache \
           -clonedSourcePackagesDirPath "$RUNNER_TEMP/FluidVoiceSourcePackages" \
           -onlyUsePackageVersionsFromResolvedFile \
           build \
+          ARCHS=arm64 \
+          ONLY_ACTIVE_ARCH=NO \
           CODE_SIGN_IDENTITY="" \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGNING_ALLOWED=NO
@@ -50,6 +52,8 @@ jobs:
       run: |
         APP_PATH="$(find DerivedData/Build/Products/Debug -maxdepth 1 -name '*.app' | head -1)"
         test -n "$APP_PATH"
+        APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Contents/Info.plist")"
+        lipo -verify_arch arm64 "$APP_PATH/Contents/MacOS/$APP_EXECUTABLE"
         ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" FluidVoice-Debug.zip
 
     - name: Upload artifact
