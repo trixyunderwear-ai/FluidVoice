@@ -33,6 +33,12 @@ let package = Package(
                 "DynamicNotchKit",
                 .product(name: "TranscribeCpp", package: "transcribe-cpp-swift"),
             ],
+            path: "Sources/Fluid",
+            exclude: [
+                "CoreAudioCaptureSupportBridge.c",
+                "CoreAudioCaptureSupportBridge.h",
+                "Fluid-Bridging-Header.h",
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]

@@ -133,7 +133,9 @@ final actor GigaAMServerController {
         process.executableURL = URL(fileURLWithPath: binaryPath)
         // e2e_rnnt emits punctuation, casing, and number normalization — the right
         // head for dictation. A user-managed server keeps whatever variant it runs.
-        process.arguments = ["serve", "--model-variant", "e2e_rnnt"]
+        // gigastt >= 2.22 can decode long-file windows in parallel using the
+        // existing two-session pool, without changing model weights/quality.
+        process.arguments = ["serve", "--model-variant", "e2e_rnnt", "--file-window-concurrency", "2"]
         process.standardOutput = FileHandle.nullDevice
         process.standardError = FileHandle.nullDevice
         process.terminationHandler = { process in

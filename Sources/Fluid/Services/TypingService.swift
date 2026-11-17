@@ -512,7 +512,11 @@ final class TypingService {
                 self.log("[TypingService] Delay completed, calling insertTextInstantly")
                 let insertStartedAt = ProcessInfo.processInfo.systemUptime
                 self.bench("insert_call")
-                let inserted = self.insertTextInstantly(text, preferredTargetPID: preferredTargetPID)
+                let inserted = self.insertTextInstantly(
+                    text,
+                    preferredTargetPID: preferredTargetPID,
+                    requiredFocusTarget: requiredFocusTarget
+                )
                 self.bench(
                     "insert_return elapsedMs=\(Self.elapsedMs(since: insertStartedAt)) totalMs=\(Self.elapsedMs(since: requestedAt))"
                 )
@@ -575,7 +579,16 @@ final class TypingService {
 
     // MARK: - Internal insertion pipeline
 
-    private func insertTextInstantly(_ text: String, preferredTargetPID: pid_t?) -> Bool {
+    private func insertTextInstantly(
+        _ text: String,
+        preferredTargetPID: pid_t?,
+        requiredFocusTarget: CapturedFocusTarget? = nil
+    ) -> Bool {
+        if let requiredFocusTarget {
+            // A captured destination must never enter the generic pipeline:
+            // its global/AX/current-app fallbacks may reach a different field.
+            return self.insertTextIntoCapturedTarget(text, preferredTargetPID: preferredTargetPID, target: requiredFocusTarget)
+        }
         self.log("[TypingService] insertTextInstantly called with \(text.count) characters")
         self.log("[TypingService] Attempting to type text: \"\(text.prefix(50))\(text.count > 50 ? "..." : "")\"")
 
@@ -673,6 +686,31 @@ final class TypingService {
         }
         self.log("[TypingService] Character-by-character typing completed")
         return true
+    }
+
+    private func insertTextIntoCapturedTarget(_ text: String, preferredTargetPID: pid_t?, target: CapturedFocusTarget) -> Bool {
+        guard Self.canInsertBeforePostInsertionAction(
+            preferredTargetPID: preferredTargetPID,
+            requiredTargetPID: target.pid,
+            isSecureTextField: target.isSecureTextField,
+            exactFocusIsActive: Self.isExactFocusTargetActive(target)
+        ) else { return false }
+
+        // Address the saved AX element itself rather than rediscovering an
+        // arbitrary input in the currently active window.
+        let result = AXUIElementSetAttributeValue(target.element, kAXSelectedTextAttribute as CFString, text as CFTypeRef)
+        if result == .success { return true }
+
+        // Electron/terminal inputs may not expose a writable selected-text AX
+        // attribute. Keep their clipboard compatibility path PID-only, with a
+        // fresh exact-field check both here and immediately before dispatch.
+        guard Self.isExactFocusTargetActive(target) else { return false }
+        return self.insertTextViaClipboardToPid(
+            text,
+            targetPID: target.pid,
+            activateTargetFirst: false,
+            requiredFocusTarget: target
+        )
     }
 
     private func waitForPhysicalModifiersToRelease(timeout: TimeInterval) -> Bool {
@@ -908,7 +946,12 @@ final class TypingService {
 
     /// Clipboard-paste insertion targeted at a specific PID.
     /// Uses postToPid for Cmd+V while preserving the full previous pasteboard payload.
-    private func insertTextViaClipboardToPid(_ text: String, targetPID: pid_t, activateTargetFirst: Bool = true) -> Bool {
+    private func insertTextViaClipboardToPid(
+        _ text: String,
+        targetPID: pid_t,
+        activateTargetFirst: Bool = true,
+        requiredFocusTarget: CapturedFocusTarget? = nil
+    ) -> Bool {
         self.log("[TypingService] Starting clipboard-to-PID insertion to PID \(targetPID)")
 
         guard targetPID > 0 else {
@@ -922,6 +965,11 @@ final class TypingService {
         }
 
         return self.withTemporaryPasteboardString(text, restoreDelayMicros: 5_000_000) {
+            if let requiredFocusTarget,
+               !Self.isExactFocusTargetActive(requiredFocusTarget)
+            {
+                return false
+            }
             let vKey = Self.pasteVirtualKeyCode
             guard let cmdVDown = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: true),
                   let cmdVUp = CGEvent(keyboardEventSource: nil, virtualKey: vKey, keyDown: false)
