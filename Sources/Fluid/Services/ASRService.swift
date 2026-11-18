@@ -2694,7 +2694,9 @@ final class ASRService: ObservableObject {
         }
 
         let result = try await transcriptionExecutor.run { [provider = self.transcriptionProvider] in
-            try await provider.transcribeFinal(samples)
+            // API jobs must not finalize the microphone recording's live socket.
+            if provider is GigaAMProvider { return try await provider.transcribe(samples) }
+            return try await provider.transcribeFinal(samples)
         }
 
         if !self.hasCompletedFirstTranscription {
@@ -2756,7 +2758,12 @@ final class ASRService: ObservableObject {
                         samples.append(contentsOf: repeatElement(0.0, count: 16_000 - sampleCount))
                     }
 
-                    let result = try await provider.transcribeFinal(samples)
+                    let result: ASRTranscriptionResult
+                    if provider is GigaAMProvider {
+                        result = try await provider.transcribe(samples)
+                    } else {
+                        result = try await provider.transcribeFinal(samples)
+                    }
                     if !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         textParts.append(result.text)
                     }

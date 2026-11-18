@@ -25,3 +25,9 @@ assert "self.streamingSession.hasStreamedAudio()" in provider
 assert "beginStreamingSession()" in asr and "cancelStreamingSession()" in asr
 assert "if !(self.transcriptionProvider is GigaAMProvider) || self.isRunning" in asr
 print("Streaming lifecycle and full-audio fallback wiring verified")
+
+api_samples = asr.split("func transcribeSamplesForAPI(", 1)[1].split("func transcribeFileForAPI(", 1)[0]
+api_file = asr.split("func transcribeFileForAPI(", 1)[1].split("func stopWithoutTranscription", 1)[0]
+assert "if provider is GigaAMProvider { return try await provider.transcribe(samples) }" in api_samples
+assert "if provider is GigaAMProvider {\n                        result = try await provider.transcribe(samples)" in api_file
+print("API transcription is isolated from microphone WebSocket finalization")
