@@ -205,8 +205,8 @@ final actor GigaAMServerController {
 // MARK: - GigaAM Provider
 
 /// TranscriptionProvider for Sber GigaAM v3 (Russian) backed by a local gigastt server.
-/// Audio never leaves the machine: the provider posts PCM WAV chunks to the
-/// OpenAI-compatible endpoint at 127.0.0.1 and returns the decoded text.
+/// Audio stays on this machine. Live dictation uses a local WebSocket; complete
+/// recordings use the HTTP endpoint when streaming is unavailable.
 final class GigaAMProvider: TranscriptionProvider {
     let name = "GigaAM v3 (gigastt)"
 
@@ -217,6 +217,7 @@ final class GigaAMProvider: TranscriptionProvider {
 
     private(set) var isReady: Bool = false
     private var modelVariantSupported = true
+    private let streamingSession = GigaAMStreamingSession()
 
     var isAvailable: Bool { true }
     var shouldClearCacheAfterCancellation: Bool { false }
@@ -244,6 +245,51 @@ final class GigaAMProvider: TranscriptionProvider {
         return ASRTranscriptionResult(text: text)
     }
 
+    func beginStreamingSession() async {
+        await self.streamingSession.begin()
+    }
+
+    func cancelStreamingSession() async {
+        await self.streamingSession.cancel()
+    }
+
+    func transcribeStreaming(_ samples: [Float]) async throws -> ASRTranscriptionResult {
+        do {
+            let text = try await self.streamingSession.preview(samples, serverURL: GigaAMServerController.serverURL)
+            return ASRTranscriptionResult(text: text)
+        } catch {
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            // A broken preview is not a final transcript. Keep captured PCM in
+            // ASRService; transcribeFinal retries the complete recording over HTTP.
+            return ASRTranscriptionResult(text: "", confidence: 0)
+        }
+    }
+
+    func transcribeFinal(_ samples: [Float]) async throws -> ASRTranscriptionResult {
+        if await self.streamingSession.hasStreamedAudio() {
+            do {
+                let text = try await self.streamingSession.finish(samples, serverURL: GigaAMServerController.serverURL)
+                DebugLogger.shared.benchmark("GIGAAM_STREAM", message: "final source=websocket samples=\(samples.count) chars=\(text.count)", source: "GigaAMProvider")
+                return ASRTranscriptionResult(text: text)
+            } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                DebugLogger.shared.warning("GigaAM: streaming final unavailable; using complete-audio HTTP fallback", source: "GigaAMProvider")
+                DebugLogger.shared.benchmark("GIGAAM_STREAM", message: "final source=http reason=stream_unavailable samples=\(samples.count)", source: "GigaAMProvider")
+                await self.streamingSession.cancel()
+            }
+        } else {
+            DebugLogger.shared.benchmark("GIGAAM_STREAM", message: "final source=http reason=no_stream samples=\(samples.count)", source: "GigaAMProvider")
+        }
+        await self.streamingSession.cancel()
+        try Task.checkCancellation()
+        return try await self.transcribe(samples)
+    }
+
+    func transcribeDictionaryTraining(_ samples: [Float]) async throws -> ASRTranscriptionResult {
+        await self.streamingSession.cancel()
+        return try await self.transcribe(samples)
+    }
+
     func modelsExistOnDisk() -> Bool {
         // The gigastt server owns its model cache; the binary being present is the
         // closest synchronous equivalent of "installed".
@@ -253,6 +299,7 @@ final class GigaAMProvider: TranscriptionProvider {
     func clearCache() async throws {
         // Models are managed by gigastt (`gigastt download` / its own cache directory);
         // FluidVoice does not delete files owned by another tool.
+        await self.streamingSession.cancel()
         self.isReady = false
     }
 
