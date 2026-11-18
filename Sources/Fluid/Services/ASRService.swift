@@ -336,6 +336,7 @@ final class ASRService: ObservableObject {
         _ = await preparationTask?.result
         _ = await downloadTask?.result
         await self.providerResetDrain?.task.value
+        await self.gigaamProvider?.cancelStreamingSession()
         await self.transcriptionExecutor.cancelAndAwaitPending()
 
         self.fluidAudioProvider = nil
@@ -640,7 +641,11 @@ final class ASRService: ObservableObject {
         }
         let resetDrainID = UUID()
         let executor = self.transcriptionExecutor
-        let resetDrainTask = Task { await executor.cancelAndAwaitPending() }
+        let retiringGigaAMProvider = self.gigaamProvider
+        let resetDrainTask = Task {
+            await retiringGigaAMProvider?.cancelStreamingSession()
+            await executor.cancelAndAwaitPending()
+        }
         self.providerResetDrain = (resetDrainID, resetDrainTask)
         // Keep the task handle until its provider has stopped and cancellation cleanup has
         // completed. The next ensureAsrReady call waits for it before touching the same cache.
@@ -1799,6 +1804,11 @@ final class ASRService: ObservableObject {
         self.benchmarkCompletedStreamingChunks = 0
         self.benchmarkLastChunkSampleCount = 0
         (self.transcriptionProvider as? FluidAudioProvider)?.resetStreamingPreviewCache()
+        await self.transcriptionProvider.beginStreamingSession()
+        guard startGeneration == self.audioCaptureStartGeneration, !self.isTerminating else {
+            await self.transcriptionProvider.cancelStreamingSession()
+            return .failed
+        }
         self.audioCapturePipeline.setRecordingEnabled(
             true,
             sessionID: captureSessionID,
@@ -2342,6 +2352,21 @@ final class ASRService: ObservableObject {
         onCaptureStopped: (@MainActor () -> Void)? = nil,
         forDictionaryTraining: Bool = false
     ) async -> String {
+        let provider = self.transcriptionProvider
+        let captureSessionID = self.benchmarkSessionID
+        let text = await self.stopRecordingAndTranscribe(onCaptureStopped: onCaptureStopped, forDictionaryTraining: forDictionaryTraining)
+        // Empty/silent/error paths also release the socket. Do not let cleanup
+        // from an older stop close a subsequently started recording's session.
+        if captureSessionID == self.benchmarkSessionID {
+            await provider.cancelStreamingSession()
+        }
+        return text
+    }
+
+    private func stopRecordingAndTranscribe(
+        onCaptureStopped: (@MainActor () -> Void)?,
+        forDictionaryTraining: Bool
+    ) async -> String {
         DebugLogger.shared.info("🛑 STOP() called - beginning shutdown sequence", source: "ASRService")
         self.lastStopOutcome = .empty
         if forDictionaryTraining || self.isDictionaryTrainingCaptureActive {
@@ -2556,7 +2581,7 @@ final class ASRService: ObservableObject {
             let finalRTF = finalAudioSeconds > 0 ? (Double(finalElapsedMs) / 1000.0) / finalAudioSeconds : 0
             DebugLogger.shared.debug("stop(): final transcription finished source=\(finalSource)", source: "ASRService")
             DebugLogger.shared.debug(
-                "Transcription completed: '\(result.text)' (confidence: \(result.confidence))",
+                "Transcription completed: chars=\(result.text.count) (confidence: \(result.confidence))",
                 source: "ASRService"
             )
             DebugLogger.shared.info(
@@ -2669,7 +2694,9 @@ final class ASRService: ObservableObject {
         }
 
         let result = try await transcriptionExecutor.run { [provider = self.transcriptionProvider] in
-            try await provider.transcribeFinal(samples)
+            // API jobs must not finalize the microphone recording's live socket.
+            if provider is GigaAMProvider { return try await provider.transcribe(samples) }
+            return try await provider.transcribeFinal(samples)
         }
 
         if !self.hasCompletedFirstTranscription {
@@ -2731,7 +2758,12 @@ final class ASRService: ObservableObject {
                         samples.append(contentsOf: repeatElement(0.0, count: 16_000 - sampleCount))
                     }
 
-                    let result = try await provider.transcribeFinal(samples)
+                    let result: ASRTranscriptionResult
+                    if provider is GigaAMProvider {
+                        result = try await provider.transcribe(samples)
+                    } else {
+                        result = try await provider.transcribeFinal(samples)
+                    }
                     if !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         textParts.append(result.text)
                     }
@@ -2803,6 +2835,7 @@ final class ASRService: ObservableObject {
         // CRITICAL: Set isRunning to false FIRST to signal any in-flight chunks to abort early
         self.isRunning = false
         self.audioCapturePipeline.setRecordingEnabled(false)
+        await self.transcriptionProvider.cancelStreamingSession()
 
         // Stop monitoring device
         self.stopMonitoringDevice()
@@ -4859,11 +4892,13 @@ final class ASRService: ObservableObject {
 
             if !newText.isEmpty {
                 // Smart diff: only show truly new words
-                let updatedText = self.smartDiffUpdate(previous: self.previousFullTranscription, current: newText)
+                let updatedText = self.transcriptionProvider is GigaAMProvider
+                    ? newText
+                    : self.smartDiffUpdate(previous: self.previousFullTranscription, current: newText)
                 self.partialTranscription = updatedText
                 self.previousFullTranscription = newText
 
-                DebugLogger.shared.debug("✅ Streaming: '\(updatedText)' (\(String(format: "%.2f", duration))s)", source: "ASRService")
+                DebugLogger.shared.debug("✅ Streaming: chars=\(updatedText.count) (\(String(format: "%.2f", duration))s)", source: "ASRService")
             }
             let rtf = duration / (Double(currentSampleCount) / 16_000.0)
             let chunkDoneAgeMs = self.elapsedMilliseconds(since: self.benchmarkRecordingStartedAt)
@@ -5238,7 +5273,12 @@ private extension ASRService {
         }
         let startedAt = Date().timeIntervalSince1970
         self.benchmarkLog("streaming_timer_stop begin")
-        task.cancel()
+        // Preserve GigaAM's live socket when stop races an in-flight preview.
+        // isRunning is already false; the loop exits after its bounded send or
+        // at most one 200 ms timer sleep. Explicit abort closes the socket above.
+        if !(self.transcriptionProvider is GigaAMProvider) || self.isRunning {
+            task.cancel()
+        }
         // Wait for the task to actually finish - this is critical!
         // The task may be in the middle of processStreamingChunk()
         _ = await task.result

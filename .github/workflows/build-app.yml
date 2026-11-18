@@ -29,6 +29,9 @@ jobs:
     - name: Test original-field dictation and manual recovery
       run: python3 Tests/run_original_dictation_target_tests.py
 
+    - name: Test GigaAM streaming lifecycle
+      run: python3 Tests/run_gigaam_streaming_tests.py
+
     - name: Build (unsigned)
       run: |
         set -o pipefail

@@ -148,6 +148,10 @@ protocol TranscriptionProvider {
     /// Providers can use faster/lighter paths than final transcription when needed.
     func transcribeStreaming(_ samples: [Float]) async throws -> ASRTranscriptionResult
 
+    /// Recording boundaries for providers that retain a live network session.
+    func beginStreamingSession() async
+    func cancelStreamingSession() async
+
     /// Transcribe audio for final output when recording stops.
     /// Providers can use higher-quality passes (e.g., vocabulary rescoring) here.
     func transcribeFinal(_ samples: [Float]) async throws -> ASRTranscriptionResult
@@ -176,6 +180,8 @@ protocol TranscriptionProvider {
 
 // Default implementation for optional methods
 extension TranscriptionProvider {
+    func beginStreamingSession() async {}
+    func cancelStreamingSession() async {}
     func modelsExistOnDisk() -> Bool { return false }
     func clearCache() async throws {}
     var shouldClearCacheAfterCancellation: Bool { true }

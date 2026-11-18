@@ -5029,7 +5029,7 @@ final class SettingsStore: ObservableObject {
             case .qwen3Asr, .whisperMedium, .whisperLargeTurbo, .whisperLarge:
                 return false // Too slow for real-time chunk processing
             case .gigaamV3:
-                return false // Full-buffer HTTP round-trips per tick are too wasteful; final-only.
+                return true // A persistent WebSocket receives only new PCM, not full-buffer HTTP requests.
             default:
                 return true // All other models support streaming
             }
@@ -5052,7 +5052,7 @@ final class SettingsStore: ObservableObject {
         /// Models without native incremental decoding should use a slower interval.
         var streamingPreviewIntervalSeconds: Double {
             switch self {
-            case .parakeetRealtime:
+            case .parakeetRealtime, .gigaamV3:
                 return 0.2
             case .nemotronStreaming, .nemotronStreaming320:
                 return 0.32
@@ -5067,7 +5067,7 @@ final class SettingsStore: ObservableObject {
         /// Cohere performs better with a slightly larger prefix than the default 1 second.
         var minimumStreamingPreviewSeconds: Double {
             switch self {
-            case .parakeetRealtime:
+            case .parakeetRealtime, .gigaamV3:
                 return 0.2
             case .nemotronStreaming, .nemotronStreaming320:
                 return 0.64
