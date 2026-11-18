@@ -1701,7 +1701,7 @@ struct ContentView: View {
         self.recordingAppInfo = info
         self.rewriteModeService.setPromptAppBundleID(info.bundleId)
         let reason = capturedTarget == nil ? "missing_ax_target" : (focusTarget == nil ? "target_pid_mismatch" : "captured")
-        self.appBench("focus_capture reason=\(reason) expectedPID=\(expectedPID.map(String.init) ?? "nil") capturedPID=\(capturedTarget.map { String($0.pid) } ?? "nil")")
+        self.appBench("focus_capture reason=\(reason) expectedPID=\(expectedPID.map(String.init) ?? "nil") capturedPID=\(capturedTarget.map { String($0.pid) } ?? "nil") kind=\(focusTarget?.kind.rawValue ?? "none")")
     }
 
     private func captureRecordingFormattingContextIfNeeded() {
@@ -2479,6 +2479,7 @@ struct ContentView: View {
             let targetMatchesRecordingFocus = typingTarget.pid != nil
                 && typingTarget.pid == self.recordingFocusTarget?.pid
             let spokenSendAllowed = spokenSendRequested
+                && focusTarget.kind == .field
                 && aiFallbackReason == nil
                 && (sendsExistingDraft || !finalText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 && targetMatchesRecordingFocus
@@ -2488,9 +2489,9 @@ struct ContentView: View {
             if typingTarget.shouldRestoreOriginalFocus {
                 await self.restoreFocusToRecordingTarget()
             }
-            guard TypingService.isExactFocusTargetActive(focusTarget) else {
+            guard TypingService.isCapturedDestinationActive(focusTarget) else {
                 ClipboardService.copyToClipboard(finalText)
-                DebugLogger.shared.warning("Dictation retained for manual paste: original field could not be restored", source: "ContentView")
+                DebugLogger.shared.warning("Dictation retained for manual paste: original destination could not be restored", source: "ContentView")
                 self.hideOverlayAfterOutput()
                 return
             }
@@ -3348,14 +3349,14 @@ struct ContentView: View {
         let startedAt = ProcessInfo.processInfo.systemUptime
         self.appBench("focus_restore_start targetPID=\(pid)")
         if let focusTarget = self.recordingFocusTarget, focusTarget.pid == pid {
-            if TypingService.isExactFocusTargetActive(focusTarget) {
-                self.appBench("focus_restore_result activated=false element=true elapsedMs=0 reason=already_focused")
+            if TypingService.isCapturedDestinationActive(focusTarget) {
+                self.appBench("focus_restore_result activated=false destination=true kind=\(focusTarget.kind.rawValue) elapsedMs=0 reason=already_focused")
                 return
             }
             let activated = TypingService.activateApp(pid: pid)
-            let focusedElementRestored = TypingService.restoreFocusTarget(focusTarget)
+            let destinationRestored = TypingService.restoreFocusTarget(focusTarget)
             self.appBench(
-                "focus_restore_result activated=\(activated) element=\(focusedElementRestored) elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
+                "focus_restore_result activated=\(activated) destination=\(destinationRestored) kind=\(focusTarget.kind.rawValue) elapsedMs=\(Int(((ProcessInfo.processInfo.systemUptime - startedAt) * 1000).rounded()))"
             )
             return
         }
