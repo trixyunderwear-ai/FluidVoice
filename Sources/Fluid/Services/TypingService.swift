@@ -200,43 +200,59 @@ final class TypingService {
 
     /// Best-effort: returns the PID owning the currently focused accessibility element.
     /// This is more reliable than NSWorkspace.frontmostApplication for floating overlays/launchers.
-    static func captureSystemFocusTarget() -> CapturedFocusTarget? {
-        // Accessibility is required to query system-focused AX element.
+    static func captureSystemFocusTarget(expectedPID: pid_t? = nil) -> CapturedFocusTarget? {
         guard AXIsProcessTrusted() else {
             self.storeFocusSnapshot(nil)
+            DebugLogger.shared.benchmark("FOCUS_CAPTURE", message: "result=untrusted", source: "TypingService")
             return nil
         }
-
-        let systemWideElement = AXUIElementCreateSystemWide()
-        var focusedElementRef: CFTypeRef?
-
-        let result = AXUIElementCopyAttributeValue(
-            systemWideElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElementRef
-        )
-        guard result == .success, let focusedElementRef else {
-            Self.storeFocusSnapshot(nil)
+        let originalPID = expectedPID ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+        guard let element = self.focusedAXElement(expectedPID: originalPID),
+              let target = self.capturedFocusTarget(element, expectedPID: originalPID)
+        else {
+            self.storeFocusSnapshot(nil)
+            DebugLogger.shared.benchmark("FOCUS_CAPTURE", message: "result=unavailable_or_rejected", source: "TypingService")
             return nil
         }
-        guard CFGetTypeID(focusedElementRef) == AXUIElementGetTypeID() else {
-            Self.storeFocusSnapshot(nil)
-            return nil
-        }
+        self.storeFocusSnapshot(FocusSnapshot(pid: target.pid, window: target.window, element: target.element))
+        DebugLogger.shared.benchmark("FOCUS_CAPTURE", message: "result=captured pid=\(target.pid)", source: "TypingService")
+        return target
+    }
 
-        let element = unsafeBitCast(focusedElementRef, to: AXUIElement.self)
+    /// Some applications expose focus on their AX application object before the
+    /// system-wide attribute is available. Never use an inactive app's stale focus.
+    private static func focusedAXElement(expectedPID: pid_t?) -> AXUIElement? {
+        func read(_ owner: AXUIElement) -> AXUIElement? {
+            var ref: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(owner, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
+                  let ref, CFGetTypeID(ref) == AXUIElementGetTypeID()
+            else { return nil }
+            return unsafeBitCast(ref, to: AXUIElement.self)
+        }
+        if let element = read(AXUIElementCreateSystemWide()) {
+            var pid: pid_t = 0
+            AXUIElementGetPid(element, &pid)
+            guard pid > 0, expectedPID == nil || pid == expectedPID else { return nil }
+            return element
+        }
+        guard let expectedPID, expectedPID > 0,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
+              let element = read(AXUIElementCreateApplication(expectedPID))
+        else { return nil }
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
-        guard pid > 0 else {
-            Self.storeFocusSnapshot(nil)
-            return nil
-        }
+        return pid == expectedPID ? element : nil
+    }
+
+    private static func capturedFocusTarget(_ element: AXUIElement, expectedPID: pid_t?) -> CapturedFocusTarget? {
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        guard pid > 0, expectedPID == nil || pid == expectedPID else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         let window = Self.copyAXElementAttribute(from: appElement, attribute: kAXFocusedWindowAttribute as CFString)
             ?? Self.copyAXElementAttribute(from: appElement, attribute: kAXMainWindowAttribute as CFString)
-        Self.storeFocusSnapshot(FocusSnapshot(pid: pid, window: window, element: element))
-        Self.logFocusState("[TypingService] Captured focus snapshot")
-        return CapturedFocusTarget(pid: pid, window: window, element: element)
+        let target = CapturedFocusTarget(pid: pid, window: window, element: element)
+        return target.isSecureTextField ? nil : target
     }
 
     static func captureSystemFocusedPID() -> pid_t? {
@@ -244,22 +260,9 @@ final class TypingService {
     }
 
     static func isExactFocusTargetActive(_ target: CapturedFocusTarget) -> Bool {
-        guard AXIsProcessTrusted() else { return false }
-
-        let systemWideElement = AXUIElementCreateSystemWide()
-        var focusedElementRef: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(
-            systemWideElement,
-            kAXFocusedUIElementAttribute as CFString,
-            &focusedElementRef
-        )
-        guard result == .success, let focusedElementRef,
-              CFGetTypeID(focusedElementRef) == AXUIElementGetTypeID()
-        else {
-            return false
-        }
-
-        let currentElement = unsafeBitCast(focusedElementRef, to: AXUIElement.self)
+        guard AXIsProcessTrusted(), !target.isSecureTextField,
+              let currentElement = self.focusedAXElement(expectedPID: target.pid)
+        else { return false }
         return CFEqual(currentElement, target.element)
     }
 

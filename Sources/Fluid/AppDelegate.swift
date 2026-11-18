@@ -317,6 +317,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDele
     @discardableResult
     private func bringMainWindowToFrontIfPresent() -> Bool {
         if let mainWindow = NSApp.windows.first(where: self.isMainWindow) {
+            if mainWindow.isMiniaturized {
+                mainWindow.animationBehavior = .none
+                mainWindow.deminiaturize(nil)
+            }
             if mainWindow.alphaValue <= 0.01 {
                 mainWindow.alphaValue = 1
             }

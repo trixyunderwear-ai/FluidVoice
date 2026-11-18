@@ -74,6 +74,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
 
         // Ensure we're on main thread and app is active
         DispatchQueue.main.async { [weak self] in
+            self?.retainMainWindowIfPresent()
             self?.setupMenuBarSafely()
         }
     }
@@ -876,22 +877,19 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
             mainWindows = NSApp.windows.filter(self.isFluidMainWindow)
         }
 
-        // Find an existing *non-minimized* primary window.
-        // Important: avoid programmatic deminiaturize() — it creates internal window transform animations
-        // (NSWindowTransformAnimation) that have been unstable on macOS 26.x for this app.
+        // Reuse the existing view/service ownership even when the window is
+        // minimized. Creating another ContentView would install new callbacks.
         if let window = mainWindows.first {
             self.ensureUsableMainWindow(window)
             window.animationBehavior = .none
             self.bringToFront(window)
-            if let hostedWindow, window !== hostedWindow {
-                self.hostedWindow = nil
-            }
+            self.hostedWindow = window
         } else if let window = hostedWindow, window.isReleasedWhenClosed == false {
             self.ensureUsableMainWindow(window)
             window.animationBehavior = .none
             self.bringToFront(window)
         } else {
-            // If there is no suitable window (or it's minimized), create a fresh one.
+            // Only create a view when no existing main window can be reused.
             self.createAndShowMainWindow()
         }
 
@@ -906,8 +904,13 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
         guard window.level == .normal else { return false }
         guard window.styleMask.contains(.titled) else { return false }
         guard window.canBecomeKey else { return false }
-        guard window.isMiniaturized == false else { return false }
         return window.title == "FluidVoice" || window.title.contains("FluidVoice")
+    }
+
+    func retainMainWindowIfPresent() {
+        guard let window = NSApp.windows.first(where: self.isFluidMainWindow) else { return }
+        window.isReleasedWhenClosed = false
+        self.hostedWindow = window
     }
 
     @objc private func openPreferences() {
@@ -986,6 +989,7 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     private func ensureUsableMainWindow(_ window: NSWindow) {
+        window.isReleasedWhenClosed = false
         // If the window is too small (e.g., height collapsed), reset to the default frame.
         let minSize = self.mainWindowMinimumSize
         window.minSize = minSize
@@ -1013,6 +1017,10 @@ final class MenuBarManager: NSObject, ObservableObject, NSMenuDelegate {
     }
 
     private func bringToFront(_ window: NSWindow) {
+        if window.isMiniaturized {
+            window.animationBehavior = .none
+            window.deminiaturize(nil)
+        }
         // Keep ordering explicit to avoid "opened but behind other apps" behavior.
         if window.alphaValue <= 0.01 {
             window.alphaValue = 1
