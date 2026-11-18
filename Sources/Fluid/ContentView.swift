@@ -405,16 +405,7 @@ struct ContentView: View {
                 self.refreshInputDevices()
             }
             .onDisappear {
-                Task { await self.asr.stopWithoutTranscription() }
-                self.cancelPrewarmDictationIfNeeded()
-                // Note: Overlay lifecycle is now managed by MenuBarManager
-                // Note: NotchContentState handlers capture self (a struct value copy) and are
-                // intentionally kept alive so the overlay remains fully functional when the
-                // settings window is closed. No retain cycle risk since ContentView is a value type.
-
-                // Stop accessibility polling
-                self.finishAccessibilityPermissionFlow()
-                self.removeShortcutCaptureMonitor()
+                self.handleMainWindowDisappearance()
             }
             .onChange(of: self.primaryDictationShortcuts) { _, newValue in
                 SettingsStore.shared.primaryDictationShortcuts = newValue
@@ -562,6 +553,7 @@ struct ContentView: View {
 
     private func handleContentAppear() {
         self.appear = true
+        self.menuBarManager.retainMainWindowIfPresent()
         self.refreshAccessibilityPermissionState()
 
         Task {
@@ -601,6 +593,17 @@ struct ContentView: View {
 
         self.loadProviderState()
         self.installShortcutCaptureMonitor()
+    }
+
+    private func handleMainWindowDisappearance() {
+        // Recording, model prewarm, and hotkey callbacks are app-owned. Hiding
+        // their settings window must not cancel an active background dictation.
+        Task { @MainActor in
+            guard !self.asr.isRunningOrStarting else { return }
+            await self.asr.stopMicrophonePreview()
+        }
+        self.finishAccessibilityPermissionFlow()
+        self.removeShortcutCaptureMonitor()
     }
 
     private func scheduleDelayedAudioInitialization() {
@@ -1684,19 +1687,21 @@ struct ContentView: View {
     private func captureRecordingTargetContext() {
         // Capture the focused target PID BEFORE any overlay/UI changes.
         // Used to restore focus when the user interacts with overlay dropdowns.
-        let focusTarget = TypingService.captureSystemFocusTarget()
+        let expectedPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let capturedTarget = TypingService.captureSystemFocusTarget(expectedPID: expectedPID)
+        let focusTarget = capturedTarget.flatMap { target -> TypingService.CapturedFocusTarget? in
+            guard expectedPID == nil || target.pid == expectedPID else { return nil }
+            return target
+        }
         self.recordingFocusTarget = focusTarget
-        let focusedPID = focusTarget?.pid
-            ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let focusedPID = focusTarget?.pid ?? expectedPID
         NotchContentState.shared.recordingTargetPID = focusedPID
 
         let info = self.getCurrentAppInfo()
         self.recordingAppInfo = info
         self.rewriteModeService.setPromptAppBundleID(info.bundleId)
-        DebugLogger.shared.debug(
-            "Captured recording app context: app=\(info.name), bundleId=\(info.bundleId), title=\(info.windowTitle)",
-            source: "ContentView"
-        )
+        let reason = capturedTarget == nil ? "missing_ax_target" : (focusTarget == nil ? "target_pid_mismatch" : "captured")
+        self.appBench("focus_capture reason=\(reason) expectedPID=\(expectedPID.map(String.init) ?? "nil") capturedPID=\(capturedTarget.map { String($0.pid) } ?? "nil")")
     }
 
     private func captureRecordingFormattingContextIfNeeded() {
@@ -2465,6 +2470,8 @@ struct ContentView: View {
                 // History was saved above. Also retain a plain clipboard backup
                 // when Accessibility could not capture the original field.
                 ClipboardService.copyToClipboard(finalText)
+                let reason = self.recordingFocusTarget == nil ? "missing_ax_target" : "target_pid_mismatch"
+                self.appBench("automatic_delivery_skipped reason=\(reason) targetPID=\(typingTarget.pid.map(String.init) ?? "nil") capturedPID=\(self.recordingFocusTarget.map { String($0.pid) } ?? "nil")")
                 self.hideOverlayAfterOutput()
                 return
             }
@@ -3259,6 +3266,7 @@ struct ContentView: View {
             return
         }
 
+        self.captureRecordingContext()
         self.advanceOverlayLifecycle()
         self.setActiveRecordingMode(.dictate)
         let shouldShowDictationOverlay = !self.isRecordingForCommand
@@ -3284,7 +3292,6 @@ struct ContentView: View {
                 if shouldPlayStartSound {
                     TranscriptionSoundPlayer.shared.playStartSound()
                 }
-                self.captureRecordingContext()
                 self.prewarmPrivateAIDictationIfNeeded(for: .primary)
                 DebugLogger.shared.benchmark(
                     "APP_BENCH",
@@ -3531,6 +3538,7 @@ struct ContentView: View {
             },
             commandModeCallback: {
                 DebugLogger.shared.info("Command mode triggered", source: "ContentView")
+                guard !self.asr.isRunningOrStarting else { return }
                 self.captureRecordingContext()
 
                 // Set flag so stopAndProcessTranscription knows to process as command
@@ -3538,8 +3546,6 @@ struct ContentView: View {
 
                 // Set overlay mode to command
                 self.menuBarManager.setOverlayMode(.command)
-
-                guard !self.asr.isRunningOrStarting else { return }
 
                 self.advanceOverlayLifecycle()
 
@@ -3561,6 +3567,7 @@ struct ContentView: View {
                 }
             },
             rewriteModeCallback: {
+                guard !self.asr.isRunningOrStarting else { return }
                 self.captureRecordingContext()
 
                 // Try to capture text first while still in the other app
@@ -3585,8 +3592,6 @@ struct ContentView: View {
 
                 // Set flag so stopAndProcessTranscription knows to process as rewrite
                 self.setActiveRecordingMode(.edit)
-
-                guard !self.asr.isRunningOrStarting else { return }
 
                 self.advanceOverlayLifecycle()
 
@@ -3924,6 +3929,13 @@ extension ContentView {
     ) {
         DebugLogger.shared.debug("Begin dictation recording for slot \(slot.rawValue)", source: "ContentView")
         self.appBench("begin_recording slot=\(slot.rawValue) mode=\(mode.rawValue)")
+        guard !self.asr.isRunningOrStarting else {
+            self.appBench("asr_start_skipped reason=already_running_or_starting")
+            return
+        }
+        // Freeze destination and formatting context while the user's field
+        // still owns focus, before mode changes or any overlay presentation.
+        self.captureRecordingContext()
         if self.isOnboardingVoicePlaygroundStepActive {
             self.asr.finalText = ""
             self.settings.onboardingPlaygroundValidated = false
@@ -3935,10 +3947,6 @@ extension ContentView {
         self.setActiveRecordingMode(mode)
         self.rewriteModeService.clearState()
 
-        guard !self.asr.isRunningOrStarting else {
-            self.appBench("asr_start_skipped reason=already_running_or_starting")
-            return
-        }
         let isOnboardingTryout = self.isOnboardingVoicePlaygroundStepActive && mode == .dictate
         if isOnboardingTryout {
             AnalyticsService.shared.recordOnboardingTryoutAttemptStarted(startMethod: startMethod)
@@ -3958,7 +3966,6 @@ extension ContentView {
                 if SettingsStore.shared.enableTranscriptionSounds {
                     TranscriptionSoundPlayer.shared.playStartSound()
                 }
-                self.captureRecordingContext()
                 self.prewarmPrivateAIDictationIfNeeded(for: slot)
                 self.appBench("overlay_phase phase=recording trigger=first_pcm")
             })

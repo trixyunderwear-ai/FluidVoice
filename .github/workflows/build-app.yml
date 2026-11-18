@@ -32,6 +32,12 @@ jobs:
     - name: Test GigaAM streaming lifecycle
       run: python3 Tests/run_gigaam_streaming_tests.py
 
+    - name: Test pre-overlay capture and background window lifecycle
+      run: python3 Tests/run_focus_capture_lifecycle_tests.py
+
+    - name: Test verified application-scoped focus recovery
+      run: python3 Tests/run_application_focus_capture_tests.py
+
     - name: Build (unsigned)
       run: |
         set -o pipefail
