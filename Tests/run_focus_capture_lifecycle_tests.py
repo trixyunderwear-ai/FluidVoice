@@ -38,7 +38,7 @@ window_methods = "\n".join([
 swift = r'''
 import Foundation
 typealias pid_t = Int32
-struct Target { let pid: Int32; let element: Int }
+struct Target { enum Kind: String { case field, application }; let pid: Int32; let element: Int; var kind = Kind.field }
 final class App { let processIdentifier: Int32; init(_ pid: Int32) { processIdentifier = pid } }
 final class NSWorkspace { static let shared = NSWorkspace(); var frontmostApplication: App? = App(11) }
 enum Focus {

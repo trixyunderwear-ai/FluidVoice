@@ -7,11 +7,23 @@ final class TypingService {
     nonisolated static let synthesizedEventUserData: Int64 = 0x46565353
 
     struct CapturedFocusTarget {
+        enum Kind: String { case field, application }
         let pid: pid_t
         let window: AXUIElement?
         let element: AXUIElement
+        let kind: Kind
+        let capturedCGWindowID: CGWindowID?
+
+        init(pid: pid_t, window: AXUIElement?, element: AXUIElement, kind: Kind = .field, capturedCGWindowID: CGWindowID? = nil) {
+            self.pid = pid
+            self.window = window
+            self.element = element
+            self.kind = kind
+            self.capturedCGWindowID = capturedCGWindowID
+        }
 
         var isSecureTextField: Bool {
+            guard self.kind == .field else { return false }
             let subrole = TypingService.stringAXAttribute(
                 from: self.element,
                 attribute: kAXSubroleAttribute as CFString
@@ -207,21 +219,32 @@ final class TypingService {
             return nil
         }
         let originalPID = expectedPID ?? NSWorkspace.shared.frontmostApplication?.processIdentifier
-        guard let element = self.focusedAXElement(expectedPID: originalPID),
-              let target = self.capturedFocusTarget(element, expectedPID: originalPID)
-        else {
+        let focus = self.focusedAXElementResult(expectedPID: originalPID)
+        let target: CapturedFocusTarget?
+        if let element = focus.element {
+            // A known secure or foreign field is a rejection, not AX unavailability.
+            target = self.capturedFocusTarget(element, expectedPID: originalPID)
+        } else if !focus.rejected, let pid = originalPID, pid > 0,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == pid {
+            let app = AXUIElementCreateApplication(pid)
+            let window = Self.copyAXElementAttribute(from: app, attribute: kAXFocusedWindowAttribute as CFString)
+                ?? Self.copyAXElementAttribute(from: app, attribute: kAXMainWindowAttribute as CFString)
+            target = CapturedFocusTarget(pid: pid, window: window, element: app, kind: .application, capturedCGWindowID: Self.frontNormalWindowID(for: pid))
+        } else {
+            target = nil
+        }
+        guard let target else {
             self.storeFocusSnapshot(nil)
             DebugLogger.shared.benchmark("FOCUS_CAPTURE", message: "result=unavailable_or_rejected", source: "TypingService")
             return nil
         }
-        self.storeFocusSnapshot(FocusSnapshot(pid: target.pid, window: target.window, element: target.element))
-        DebugLogger.shared.benchmark("FOCUS_CAPTURE", message: "result=captured pid=\(target.pid)", source: "TypingService")
+        self.storeFocusSnapshot(FocusSnapshot(pid: target.pid, window: target.window, element: target.kind == .field ? target.element : nil))
+        DebugLogger.shared.benchmark("FOCUS_CAPTURE", message: "result=captured kind=\(target.kind.rawValue) pid=\(target.pid)", source: "TypingService")
         return target
     }
 
-    /// Some applications expose focus on their AX application object before the
-    /// system-wide attribute is available. Never use an inactive app's stale focus.
-    private static func focusedAXElement(expectedPID: pid_t?) -> AXUIElement? {
+    /// Distinguish unavailable AX focus from a foreign PID, which must never fall back.
+    private static func focusedAXElementResult(expectedPID: pid_t?) -> (element: AXUIElement?, rejected: Bool) {
         func read(_ owner: AXUIElement) -> AXUIElement? {
             var ref: CFTypeRef?
             guard AXUIElementCopyAttributeValue(owner, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
@@ -232,16 +255,30 @@ final class TypingService {
         if let element = read(AXUIElementCreateSystemWide()) {
             var pid: pid_t = 0
             AXUIElementGetPid(element, &pid)
-            guard pid > 0, expectedPID == nil || pid == expectedPID else { return nil }
-            return element
+            guard pid > 0, expectedPID == nil || pid == expectedPID else { return (nil, true) }
+            return (element, false)
         }
         guard let expectedPID, expectedPID > 0,
-              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID,
-              let element = read(AXUIElementCreateApplication(expectedPID))
-        else { return nil }
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == expectedPID
+        else { return (nil, true) }
+        guard let element = read(AXUIElementCreateApplication(expectedPID)) else { return (nil, false) }
         var pid: pid_t = 0
         AXUIElementGetPid(element, &pid)
-        return pid == expectedPID ? element : nil
+        return pid == expectedPID ? (element, false) : (nil, true)
+    }
+
+    private static func focusedAXElement(expectedPID: pid_t?) -> AXUIElement? {
+        self.focusedAXElementResult(expectedPID: expectedPID).element
+    }
+
+    /// CG window order is front-to-back; skip menus, overlays and other non-normal layers.
+    private static func frontNormalWindowID(for pid: pid_t) -> CGWindowID? {
+        let options: CGWindowListOption = [.optionOnScreenOnly, .excludeDesktopElements]
+        guard let windows = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] else { return nil }
+        return windows.first { info in
+            (info[kCGWindowOwnerPID as String] as? pid_t) == pid
+                && (info[kCGWindowLayer as String] as? Int) == 0
+        }?[kCGWindowNumber as String] as? CGWindowID
     }
 
     private static func capturedFocusTarget(_ element: AXUIElement, expectedPID: pid_t?) -> CapturedFocusTarget? {
@@ -260,10 +297,24 @@ final class TypingService {
     }
 
     static func isExactFocusTargetActive(_ target: CapturedFocusTarget) -> Bool {
-        guard AXIsProcessTrusted(), !target.isSecureTextField,
+        guard target.kind == .field, AXIsProcessTrusted(), !target.isSecureTextField,
               let currentElement = self.focusedAXElement(expectedPID: target.pid)
         else { return false }
         return CFEqual(currentElement, target.element)
+    }
+
+    static func isCapturedDestinationActive(_ target: CapturedFocusTarget) -> Bool {
+        if target.kind == .field { return self.isExactFocusTargetActive(target) }
+        guard AXIsProcessTrusted(), NSWorkspace.shared.frontmostApplication?.processIdentifier == target.pid else { return false }
+        if let savedWindow = target.capturedCGWindowID {
+            guard Self.frontNormalWindowID(for: target.pid) == savedWindow else { return false }
+        }
+        let focus = self.focusedAXElementResult(expectedPID: target.pid)
+        guard !focus.rejected else { return false }
+        if let element = focus.element {
+            return self.capturedFocusTarget(element, expectedPID: target.pid) != nil
+        }
+        return true
     }
 
     @discardableResult
@@ -277,6 +328,8 @@ final class TypingService {
             _ = AXUIElementSetAttributeValue(appElement, kAXFocusedWindowAttribute as CFString, window)
             usleep(40_000)
         }
+
+        if target.kind == .application { return self.isCapturedDestinationActive(target) }
 
         for _ in 0..<3 {
             let result = AXUIElementSetAttributeValue(
@@ -692,6 +745,10 @@ final class TypingService {
     }
 
     private func insertTextIntoCapturedTarget(_ text: String, preferredTargetPID: pid_t?, target: CapturedFocusTarget) -> Bool {
+        if target.kind == .application {
+            guard preferredTargetPID == target.pid, Self.isCapturedDestinationActive(target) else { return false }
+            return self.insertTextViaClipboardToPid(text, targetPID: target.pid, activateTargetFirst: false, requiredFocusTarget: target)
+        }
         guard Self.canInsertBeforePostInsertionAction(
             preferredTargetPID: preferredTargetPID,
             requiredTargetPID: target.pid,
@@ -967,9 +1024,10 @@ final class TypingService {
             usleep(80_000)
         }
 
+        if let requiredFocusTarget, !Self.isCapturedDestinationActive(requiredFocusTarget) { return false }
         return self.withTemporaryPasteboardString(text, restoreDelayMicros: 5_000_000) {
             if let requiredFocusTarget,
-               !Self.isExactFocusTargetActive(requiredFocusTarget)
+               !Self.isCapturedDestinationActive(requiredFocusTarget)
             {
                 return false
             }

@@ -64,9 +64,11 @@ func AXUIElementSetAttributeValue(_ element: Int, _ attribute: CFString, _ value
 }
 final class TypingService {
     struct CapturedFocusTarget {
+        enum Kind { case field, application }
         let pid: Int32
         let element: Int
         var isSecureTextField = false
+        var kind = Kind.field
     }
     enum Mode { case standard, reliablePaste }
     var textInsertionMode = Mode.reliablePaste
@@ -82,6 +84,7 @@ final class TypingService {
     static func activateApp(pid: Int32) -> Bool { true }
     static func captureSystemFocusedPID() -> Int32? { focusedPID }
     static func isExactFocusTargetActive(_ target: CapturedFocusTarget) -> Bool { exactFocus }
+    static func isCapturedDestinationActive(_ target: CapturedFocusTarget) -> Bool { isExactFocusTargetActive(target) }
     CAPTURE_GUARD
     static func logFocusState(_ message: String) {}
     func log(_ message: String) {}
